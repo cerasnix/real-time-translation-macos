@@ -16,6 +16,13 @@ struct AppCommands: Commands {
                 Button("开始") { vm.start() }
                     .keyboardShortcut(.space, modifiers: [.command, .shift])
             }
+
+            Divider()
+
+            Button(vm.isShowingTestOverlay ? "关闭测试字幕场景" : "显示测试字幕场景") {
+                vm.toggleTestOverlay()
+            }
+            .keyboardShortcut("t", modifiers: [.command, .shift])
         }
 
         CommandMenu("日志") {

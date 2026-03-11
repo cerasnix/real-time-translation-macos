@@ -25,6 +25,7 @@ struct OverlayCaptionView: View {
     @ObservedObject var content: OverlayContentState
     var config: OverlayConfig
     var fixedWidth: CGFloat
+    var showsBackground: Bool = true
 
     private var displayEntries: [CaptionEntry] {
         var entries = content.recentEntries
@@ -68,7 +69,7 @@ struct OverlayCaptionView: View {
     @ViewBuilder
     private func captionBubble(entries: [CaptionEntry], maxWidth: CGFloat) -> some View {
         let resolvedWidth = maxWidth > 0 ? maxWidth : fixedWidth
-        let bubbleWidth = max(240, resolvedWidth - config.horizontalPadding * 2)
+        let bubbleWidth = max(240, min(resolvedWidth - config.horizontalPadding * 2, resolvedWidth * 0.9))
         let textWidth = max(120, bubbleWidth - config.horizontalPadding * 2)
         let lines = buildLines(entries: entries, maxWidth: textWidth)
         let limit = max(1, config.maxLines)
@@ -89,30 +90,58 @@ struct OverlayCaptionView: View {
         .frame(width: textWidth, alignment: .center)
         .fixedSize(horizontal: false, vertical: true)
         
-        if config.backgroundStyle == .glass {
-            NativeGlassContainer(
-                cornerRadius: config.cornerRadius,
-                style: .regular,
-                tintColor: nativeGlassTintColor
-            ) {
-                captionContent
-                    .padding(.horizontal, config.horizontalPadding)
-                    .padding(.vertical, config.verticalPadding)
-                    .frame(width: bubbleWidth, alignment: .center)
-            }
-            .frame(width: bubbleWidth)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        let bubbleContent = captionContent
+            .padding(.horizontal, config.horizontalPadding)
+            .padding(.vertical, config.verticalPadding)
+            .frame(width: bubbleWidth, alignment: .center)
+
+        if showsBackground {
+            bubbleBackground(content: bubbleContent, bubbleWidth: bubbleWidth)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            captionContent
-                .padding(.horizontal, config.horizontalPadding)
-                .padding(.vertical, config.verticalPadding)
-                .frame(width: bubbleWidth, alignment: .center)
-                .background(backgroundView())
+            bubbleContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
+    @ViewBuilder
+    private func bubbleBackground<Content: View>(content: Content, bubbleWidth: CGFloat) -> some View {
+        switch config.backgroundStyle {
+        case .glass:
+            NativeGlassContainer(
+                cornerRadius: config.cornerRadius,
+                style: .clear,
+                tintColor: nativeGlassTintColor
+            ) {
+                content
+            }
+            .frame(width: bubbleWidth)
+
+        case .material:
+            content
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: config.cornerRadius, style: .continuous))
+                .opacity(materialOpacity)
+                .frame(width: bubbleWidth)
+
+        case .solid:
+            content
+                .background(
+                    Color.black.opacity(config.backgroundOpacity),
+                    in: RoundedRectangle(cornerRadius: config.cornerRadius, style: .continuous)
+                )
+                .frame(width: bubbleWidth)
+        }
+    }
+
+    private var nativeGlassTintColor: NSColor {
+        let normalized = min(max((config.backgroundOpacity - 0.2) / 0.8, 0.0), 1.0)
+        let alpha = 0.002 + (normalized * 0.016)
+        return NSColor.white.withAlphaComponent(alpha)
+    }
+
+    private var materialOpacity: Double {
+        Double(0.35 + (config.backgroundOpacity * 0.35))
+    }
 }
 
 private struct CaptionLine: Identifiable {
@@ -209,73 +238,20 @@ private final class CaptionLayoutCache {
         return lines.isEmpty ? [text] : lines
     }
 }
-
-private struct VisualEffectBackground: NSViewRepresentable {
-    let material: NSVisualEffectView.Material
-    let blendingMode: NSVisualEffectView.BlendingMode
-    let state: NSVisualEffectView.State
-
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = material
-        view.blendingMode = blendingMode
-        view.state = state
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-        nsView.material = material
-        nsView.blendingMode = blendingMode
-        nsView.state = state
-    }
-}
-
 private extension OverlayCaptionView {
     func buildLines(entries: [CaptionEntry], maxWidth: CGFloat) -> [CaptionLine] {
         guard maxWidth > 0 else { return [] }
         var lines: [CaptionLine] = []
 
-        let originalFont = NSFont.systemFont(ofSize: config.fontSize, weight: .semibold)
-        let translatedFont = NSFont.systemFont(ofSize: config.fontSize * 0.9, weight: .medium)
-
         for entry in entries {
             if !entry.original.isEmpty {
-                for line in wrappedLines(entry.original, font: originalFont, maxWidth: maxWidth) {
-                    lines.append(CaptionLine(id: lines.count, text: line, isTranslation: false))
-                }
+                lines.append(CaptionLine(id: lines.count, text: entry.original, isTranslation: false))
             }
             if !entry.translated.isEmpty {
-                for line in wrappedLines(entry.translated, font: translatedFont, maxWidth: maxWidth) {
-                    lines.append(CaptionLine(id: lines.count, text: line, isTranslation: true))
-                }
+                lines.append(CaptionLine(id: lines.count, text: entry.translated, isTranslation: true))
             }
         }
 
         return lines
-    }
-
-    func wrappedLines(_ text: String, font: NSFont, maxWidth: CGFloat) -> [String] {
-        CaptionLayoutCache.shared.wrappedLines(for: text, font: font, maxWidth: maxWidth)
-    }
-
-    @ViewBuilder
-    func backgroundView() -> some View {
-        let shape = RoundedRectangle(cornerRadius: config.cornerRadius)
-        switch config.backgroundStyle {
-        case .solid:
-            shape.fill(Color.black.opacity(config.backgroundOpacity))
-        case .material:
-            VisualEffectBackground(material: .hudWindow, blendingMode: .withinWindow, state: .active)
-                .clipShape(shape)
-                .opacity(config.backgroundOpacity)
-        case .glass:
-            shape.fill(Color.black.opacity(config.backgroundOpacity))
-        }
-    }
-
-    var nativeGlassTintColor: NSColor {
-        let normalized = min(max((Double(config.backgroundOpacity) - 0.2) / 0.8, 0.0), 1.0)
-        let alpha = 0.01 + (normalized * 0.10)
-        return NSColor.black.withAlphaComponent(alpha)
     }
 }

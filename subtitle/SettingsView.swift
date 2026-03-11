@@ -67,11 +67,6 @@ struct SubtitleSettingsView: View {
                     }
                 }
             }
-
-            Section("行为") {
-                Toggle("自动滚动日志", isOn: $vm.autoScroll)
-            }
-
             Section("快捷键") {
                 LabeledContent("切换捕获") {
                     Text("Shift+Space")

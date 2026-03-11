@@ -2,6 +2,20 @@ import SwiftUI
 import AppKit
 
 @available(macOS 26.0, *)
+final class TransparentHostingView<Content: View>: NSHostingView<Content> {
+    override var isOpaque: Bool { false }
+
+    required init(rootView: Content) {
+        super.init(rootView: rootView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+@available(macOS 26.0, *)
 struct NativeGlassContainer<Content: View>: NSViewRepresentable {
     var cornerRadius: CGFloat
     var style: NSGlassEffectView.Style = .clear
@@ -36,7 +50,7 @@ struct NativeGlassContainer<Content: View>: NSViewRepresentable {
         updateContainerView(nsView, hostingView: hostingView)
     }
 
-    private func updateContainerView(_ containerView: GlassContainerHostView, hostingView: NSHostingView<Content>) {
+    private func updateContainerView(_ containerView: GlassContainerHostView, hostingView: TransparentHostingView<Content>) {
         let glassView = containerView.glassView
         if glassView.style != style {
             glassView.style = style
@@ -67,10 +81,10 @@ struct NativeGlassContainer<Content: View>: NSViewRepresentable {
     }
 
     final class Coordinator {
-        let hostingView: NSHostingView<Content>
+        let hostingView: TransparentHostingView<Content>
 
         init(rootView: Content) {
-            self.hostingView = NSHostingView(rootView: rootView)
+            self.hostingView = TransparentHostingView(rootView: rootView)
         }
     }
 

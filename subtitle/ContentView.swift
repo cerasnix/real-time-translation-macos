@@ -38,22 +38,23 @@ final class ViewModel: ObservableObject {
     }
 
     private enum DefaultsKey {
-        static let autoScroll = "settings.autoScroll"
         static let translationSource = "settings.translationSource"
         static let translationTarget = "settings.translationTarget"
         static let maxLines = "settings.maxLines"
         static let fontSize = "settings.fontSize"
         static let backgroundOpacity = "settings.backgroundOpacity"
         static let backgroundStyle = "settings.backgroundStyle"
+        static let previewExpanded = "settings.previewExpanded"
     }
 
     private let defaults: UserDefaults
 
     @Published var localeIdentifier: String
     @Published var overlayPreviewSize: CGSize
-    @Published var autoScroll: Bool {
+    @Published var isShowingTestOverlay: Bool = false
+    @Published var isPreviewExpanded: Bool {
         didSet {
-            defaults.set(autoScroll, forKey: DefaultsKey.autoScroll)
+            defaults.set(isPreviewExpanded, forKey: DefaultsKey.previewExpanded)
         }
     }
 
@@ -181,6 +182,7 @@ final class ViewModel: ObservableObject {
     }
 
     init(defaults: UserDefaults = .standard) {
+        let launchesDemoOverlay = ProcessInfo.processInfo.arguments.contains("--demo-overlay")
         let savedSource = defaults.string(forKey: DefaultsKey.translationSource) ?? "en"
         let savedTarget = defaults.string(forKey: DefaultsKey.translationTarget) ?? "zh-Hans"
         let savedMaxLines = Self.clamp(defaults.object(forKey: DefaultsKey.maxLines) as? Int ?? 2, min: 1, max: 10)
@@ -188,8 +190,10 @@ final class ViewModel: ObservableObject {
         let savedBackgroundOpacity = Self.clamp(defaults.object(forKey: DefaultsKey.backgroundOpacity) as? Double ?? 0.65, min: 0.2, max: 1.0)
         let savedBackgroundStyle = OverlayBackgroundStyle(rawValue: defaults.string(forKey: DefaultsKey.backgroundStyle) ?? "") ?? .glass
 
+        let savedPreviewExpanded = defaults.object(forKey: DefaultsKey.previewExpanded) as? Bool ?? true
+
         self.defaults = defaults
-        autoScroll = defaults.object(forKey: DefaultsKey.autoScroll) as? Bool ?? true
+        isPreviewExpanded = savedPreviewExpanded
         translationSource = savedSource
         translationTarget = savedTarget
         maxLines = savedMaxLines
@@ -237,9 +241,20 @@ final class ViewModel: ObservableObject {
         OverlayWindowController.shared.updateFontSize(fontSize)
         OverlayWindowController.shared.updateBackgroundOpacity(backgroundOpacity)
         OverlayWindowController.shared.updateBackgroundStyle(backgroundStyle)
+
+        if launchesDemoOverlay {
+            Task { @MainActor [weak self] in
+                self?.toggleTestOverlay()
+            }
+        }
     }
 
     func start() {
+        if isShowingTestOverlay {
+            OverlayWindowController.shared.hide()
+            isShowingTestOverlay = false
+        }
+
         let locale = Locale(identifier: localeIdentifier)
         updateTranscriberTranslationPair()
         Task { await TranslationService.shared.prepare(sourceIdentifier: translationSource, targetIdentifier: translationTarget) }
@@ -260,6 +275,7 @@ final class ViewModel: ObservableObject {
             legacy.stop()
         }
         OverlayWindowController.shared.hide()
+        isShowingTestOverlay = false
     }
 
     func toggle() {
@@ -470,6 +486,48 @@ final class ViewModel: ObservableObject {
             legacy.refreshCurrentTranslation()
         }
     }
+
+    func toggleTestOverlay() {
+        if isShowingTestOverlay || OverlayWindowController.shared.isVisible {
+            OverlayWindowController.shared.hide()
+            isShowingTestOverlay = false
+            return
+        }
+
+        let original = currentOriginal.trimmingCharacters(in: .whitespacesAndNewlines)
+        let translated = currentTranslated.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lastEntry = recentEntries.last
+
+        let demoOriginal = !original.isEmpty ? original : (lastEntry?.original.isEmpty == false ? lastEntry!.original : defaultOverlaySample().original)
+        let demoTranslated = !translated.isEmpty ? translated : (lastEntry?.translated.isEmpty == false ? lastEntry!.translated : defaultOverlaySample().translated)
+
+        OverlayWindowController.shared.showDemo(original: demoOriginal, translated: demoTranslated)
+        isShowingTestOverlay = true
+    }
+
+    private func defaultOverlaySample() -> (original: String, translated: String) {
+        let original: String
+        switch translationSource {
+        case "ja":
+            original = "これは権限なしで確認できるテスト字幕です"
+        case "zh-Hans":
+            original = "这是一个无需权限即可验证的测试字幕"
+        default:
+            original = "This is a test subtitle you can inspect without permissions."
+        }
+
+        let translated: String
+        switch translationTarget {
+        case "ja":
+            translated = "これは権限なしで確認できるテスト字幕です"
+        case "zh-Hans":
+            translated = "这是一个无需权限即可验证的测试字幕"
+        default:
+            translated = "This is a test subtitle you can inspect without permissions."
+        }
+
+        return (original, translated)
+    }
 }
 
 struct ContentView: View {
@@ -487,11 +545,12 @@ struct ContentView: View {
         .navigationSplitViewStyle(.prominentDetail)
         .toolbar { toolbarContent }
         .frame(minWidth: 980, minHeight: 700)
+        .animation(.snappy(duration: 0.22), value: vm.isPreviewExpanded)
     }
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .primaryAction) {
+        ToolbarItemGroup(placement: .primaryAction) {
             Button {
                 vm.toggle()
             } label: {
@@ -501,6 +560,15 @@ struct ContentView: View {
             .buttonStyle(.glassProminent)
             .tint(vm.isRunning ? .red : .accentColor)
             .keyboardShortcut(.space, modifiers: [])
+
+            Button {
+                vm.isPreviewExpanded.toggle()
+            } label: {
+                Image(systemName: vm.isPreviewExpanded ? "rectangle.compress.vertical" : "rectangle.expand.vertical")
+            }
+            .help(vm.isPreviewExpanded ? "收起实时预览" : "显示实时预览")
+            .accessibilityLabel(vm.isPreviewExpanded ? "收起预览" : "显示预览")
+            .buttonStyle(.glass)
         }
         .sharedBackgroundVisibility(.visible)
     }
@@ -513,7 +581,9 @@ struct ContentView: View {
     private var detailPane: some View {
         GeometryReader { geometry in
             VStack(alignment: .leading, spacing: 20) {
-                previewSection(availableWidth: geometry.size.width - 48)
+                if vm.isPreviewExpanded {
+                    previewSection(availableWidth: geometry.size.width - 48)
+                }
                 logPanel()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -526,7 +596,7 @@ struct ContentView: View {
     private func previewSection(availableWidth: CGFloat) -> some View {
         let stageHeight = previewStageHeight(for: availableWidth)
         let previewWindowSize = fittedPreviewWindowSize(in: CGSize(width: availableWidth, height: stageHeight))
-        let bubbleWidth = max(260, previewWindowSize.width - 32)
+        let bubbleWidth = max(260, min(previewWindowSize.width - 32, previewWindowSize.width * 0.88))
 
         return GroupBox {
             ZStack {
@@ -565,59 +635,48 @@ struct ContentView: View {
     private func logPanel() -> some View {
         GroupBox {
             if hasLogOutput {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 14) {
-                            if !statusFeedLines.isEmpty {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("运行状态")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(.secondary)
-
-                                    ForEach(Array(statusFeedLines.enumerated()), id: \.offset) { _, line in
-                                        Text(line)
-                                            .font(.system(.caption, design: .monospaced))
-                                            .foregroundStyle(.secondary)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                }
-                                .padding(14)
-                                .background(.background.secondary, in: RoundedRectangle(cornerRadius: nestedCornerRadius, style: .continuous))
-                            }
-
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("字幕记录")
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if !statusFeedLines.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("运行状态")
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
 
-                                LazyVStack(alignment: .leading, spacing: 14) {
-                                    ForEach(groupedLogEntries) { group in
-                                        VStack(alignment: .leading, spacing: 10) {
-                                            Text(group.title)
-                                                .font(.caption.weight(.semibold))
-                                                .foregroundStyle(.secondary)
+                                ForEach(Array(statusFeedLines.enumerated()), id: \.offset) { _, line in
+                                    Text(line)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                            .padding(14)
+                            .background(.background.secondary, in: RoundedRectangle(cornerRadius: nestedCornerRadius, style: .continuous))
+                        }
 
-                                            ForEach(group.entries) { entry in
-                                                LogEntryCard(entry: entry)
-                                            }
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("字幕记录")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+
+                            LazyVStack(alignment: .leading, spacing: 14) {
+                                ForEach(groupedLogEntries) { group in
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        Text(group.title)
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+
+                                        ForEach(group.entries) { entry in
+                                            LogEntryCard(entry: entry)
                                         }
                                     }
                                 }
                             }
                         }
-                        .padding(16)
-                        .id("bottom")
                     }
-                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: stageCornerRadius, style: .continuous))
-                    .onChange(of: vm.logText) {
-                        guard vm.autoScroll else { return }
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    }
-                    .onChange(of: vm.recentEntries) {
-                        guard vm.autoScroll else { return }
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    }
+                    .padding(16)
                 }
+                .background(.background.secondary, in: RoundedRectangle(cornerRadius: stageCornerRadius, style: .continuous))
                 .frame(minHeight: 320)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -835,7 +894,7 @@ private struct OverlayPreviewBubble: View {
             case .glass:
                 NativeGlassContainer(
                     cornerRadius: 20,
-                    style: .regular,
+                    style: .clear,
                     tintColor: nativeGlassTintColor
                 ) {
                     captionTextStack
@@ -885,8 +944,8 @@ private struct OverlayPreviewBubble: View {
 
     private var nativeGlassTintColor: NSColor {
         let normalized = min(max((strength - 0.2) / 0.8, 0.0), 1.0)
-        let alpha = 0.01 + (normalized * 0.10)
-        return NSColor.black.withAlphaComponent(alpha)
+        let alpha = 0.004 + (normalized * 0.02)
+        return NSColor.white.withAlphaComponent(alpha)
     }
 }
 
