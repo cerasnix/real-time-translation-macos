@@ -5,12 +5,64 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class ViewModel: ObservableObject {
-    @Published var localeIdentifier: String = Locale.current.identifier
-    @Published var autoScroll: Bool = true
-    @Published var translationSource: String = "en" {
+    enum ExportFormat {
+        case plainText
+        case srt
+
+        var title: String {
+            switch self {
+            case .plainText:
+                return "文本日志"
+            case .srt:
+                return "SRT 字幕"
+            }
+        }
+
+        var suggestedFilename: String {
+            switch self {
+            case .plainText:
+                return "subtitle-log.txt"
+            case .srt:
+                return "subtitle-captions.srt"
+            }
+        }
+
+        var contentType: UTType {
+            switch self {
+            case .plainText:
+                return .plainText
+            case .srt:
+                return UTType(filenameExtension: "srt") ?? .plainText
+            }
+        }
+    }
+
+    private enum DefaultsKey {
+        static let autoScroll = "settings.autoScroll"
+        static let translationSource = "settings.translationSource"
+        static let translationTarget = "settings.translationTarget"
+        static let maxLines = "settings.maxLines"
+        static let fontSize = "settings.fontSize"
+        static let backgroundOpacity = "settings.backgroundOpacity"
+        static let backgroundStyle = "settings.backgroundStyle"
+    }
+
+    private let defaults: UserDefaults
+
+    @Published var localeIdentifier: String
+    @Published var overlayPreviewSize: CGSize
+    @Published var autoScroll: Bool {
         didSet {
+            defaults.set(autoScroll, forKey: DefaultsKey.autoScroll)
+        }
+    }
+
+    @Published var translationSource: String {
+        didSet {
+            defaults.set(translationSource, forKey: DefaultsKey.translationSource)
             let mapped = Self.mapToSpeechLocale(from: translationSource)
             localeIdentifier = mapped
+            updateTranscriberTranslationPair()
             Task { await TranslationService.shared.prepare(sourceIdentifier: translationSource, targetIdentifier: translationTarget) }
             if isRunning {
                 stop()
@@ -18,36 +70,39 @@ final class ViewModel: ObservableObject {
             }
         }
     }
-    @Published var translationTarget: String = "zh-Hans" {
+    @Published var translationTarget: String {
         didSet {
+            defaults.set(translationTarget, forKey: DefaultsKey.translationTarget)
+            updateTranscriberTranslationPair()
+            refreshCurrentTranslation()
             Task { await TranslationService.shared.prepare(sourceIdentifier: translationSource, targetIdentifier: translationTarget) }
-            if isRunning {
-                stop()
-                start()
-            }
         }
     }
     
-    @Published var maxLines: Int = 2 {
+    @Published var maxLines: Int {
         didSet {
+            defaults.set(maxLines, forKey: DefaultsKey.maxLines)
             OverlayWindowController.shared.updateMaxLines(maxLines)
         }
     }
     
-    @Published var fontSize: CGFloat = 28 {
+    @Published var fontSize: CGFloat {
         didSet {
+            defaults.set(Double(fontSize), forKey: DefaultsKey.fontSize)
             OverlayWindowController.shared.updateFontSize(fontSize)
         }
     }
 
-    @Published var backgroundOpacity: Double = 0.65 {
+    @Published var backgroundOpacity: Double {
         didSet {
+            defaults.set(backgroundOpacity, forKey: DefaultsKey.backgroundOpacity)
             OverlayWindowController.shared.updateBackgroundOpacity(backgroundOpacity)
         }
     }
 
-    @Published var backgroundStyle: OverlayBackgroundStyle = .solid {
+    @Published var backgroundStyle: OverlayBackgroundStyle {
         didSet {
+            defaults.set(backgroundStyle.rawValue, forKey: DefaultsKey.backgroundStyle)
             OverlayWindowController.shared.updateBackgroundStyle(backgroundStyle)
         }
     }
@@ -125,7 +180,25 @@ final class ViewModel: ObservableObject {
         return []
     }
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        let savedSource = defaults.string(forKey: DefaultsKey.translationSource) ?? "en"
+        let savedTarget = defaults.string(forKey: DefaultsKey.translationTarget) ?? "zh-Hans"
+        let savedMaxLines = Self.clamp(defaults.object(forKey: DefaultsKey.maxLines) as? Int ?? 2, min: 1, max: 10)
+        let savedFontSize = Self.clamp(CGFloat(defaults.object(forKey: DefaultsKey.fontSize) as? Double ?? 28), min: 12, max: 48)
+        let savedBackgroundOpacity = Self.clamp(defaults.object(forKey: DefaultsKey.backgroundOpacity) as? Double ?? 0.65, min: 0.2, max: 1.0)
+        let savedBackgroundStyle = OverlayBackgroundStyle(rawValue: defaults.string(forKey: DefaultsKey.backgroundStyle) ?? "") ?? .glass
+
+        self.defaults = defaults
+        autoScroll = defaults.object(forKey: DefaultsKey.autoScroll) as? Bool ?? true
+        translationSource = savedSource
+        translationTarget = savedTarget
+        maxLines = savedMaxLines
+        fontSize = savedFontSize
+        backgroundOpacity = savedBackgroundOpacity
+        backgroundStyle = savedBackgroundStyle
+        overlayPreviewSize = CGSize(width: 800, height: 150)
+        localeIdentifier = Self.mapToSpeechLocale(from: savedSource)
+
         if #available(macOS 26.0, *) {
             print("[信息] 使用新的 SpeechAnalyzer API")
             let modern = ModernCaptureTranscriber()
@@ -151,14 +224,24 @@ final class ViewModel: ObservableObject {
                 }
                 .store(in: &cancellables)
         }
-        
-        // 初始化 localeIdentifier，确保它与默认的 translationSource 匹配
-        // 否则它会使用系统 locale (例如 en_JP)，这可能不被语音识别支持
-        localeIdentifier = Self.mapToSpeechLocale(from: translationSource)
+        NotificationCenter.default.publisher(for: .overlayWindowFrameDidChange)
+            .compactMap { notification in
+                (notification.userInfo?["size"] as? NSValue)?.sizeValue
+            }
+            .sink { [weak self] size in
+                self?.overlayPreviewSize = size
+            }
+            .store(in: &cancellables)
+        updateTranscriberTranslationPair()
+        OverlayWindowController.shared.updateMaxLines(maxLines)
+        OverlayWindowController.shared.updateFontSize(fontSize)
+        OverlayWindowController.shared.updateBackgroundOpacity(backgroundOpacity)
+        OverlayWindowController.shared.updateBackgroundStyle(backgroundStyle)
     }
 
     func start() {
         let locale = Locale(identifier: localeIdentifier)
+        updateTranscriberTranslationPair()
         Task { await TranslationService.shared.prepare(sourceIdentifier: translationSource, targetIdentifier: translationTarget) }
 
         if #available(macOS 26.0, *), let modern = _modernTranscriber as? ModernCaptureTranscriber {
@@ -219,6 +302,7 @@ final class ViewModel: ObservableObject {
         if !recentEntries.isEmpty {
             var recentSection = "=== 最终字幕 ===\n"
             for entry in recentEntries {
+                recentSection += "[\(Self.logTimestampFormatter.string(from: entry.createdAt))]\n"
                 if !entry.original.isEmpty {
                     recentSection += entry.original + "\n"
                 }
@@ -231,6 +315,100 @@ final class ViewModel: ObservableObject {
         }
 
         return sections.joined(separator: "\n\n")
+    }
+
+    var hasExportableLog: Bool {
+        !exportLogText().isEmpty
+    }
+
+    var hasExportableCaptions: Bool {
+        !exportableCaptionEntries.isEmpty
+    }
+
+    func exportLogs() {
+        export(format: .plainText)
+    }
+
+    func exportSRT() {
+        export(format: .srt)
+    }
+
+    func export(format: ExportFormat) {
+        let content: String
+        switch format {
+        case .plainText:
+            content = exportLogText()
+        case .srt:
+            content = exportSRTText()
+        }
+
+        guard !content.isEmpty else {
+            logUserMessage("[提示] 当前没有可导出的\(format.title)。")
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [format.contentType]
+        panel.nameFieldStringValue = format.suggestedFilename
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                do {
+                    try content.write(to: url, atomically: true, encoding: .utf8)
+                    self.logUserMessage("[信息] \(format.title)已保存: \(url.lastPathComponent)")
+                } catch {
+                    self.logUserMessage("[错误] 保存\(format.title)失败: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
+        }
+    }
+
+    func exportSRTText() -> String {
+        let entries = exportableCaptionEntries
+        guard !entries.isEmpty else { return "" }
+
+        let baseTime = entries[0].createdAt
+        let minimumDuration: TimeInterval = 1.2
+        let maximumDuration: TimeInterval = 6.0
+        let cueGap: TimeInterval = 0.05
+
+        return entries.enumerated().map { index, entry in
+            let start = max(entry.createdAt.timeIntervalSince(baseTime), 0)
+            let nextStart = index < entries.index(before: entries.endIndex)
+                ? max(entries[index + 1].createdAt.timeIntervalSince(baseTime), start)
+                : nil
+
+            let end: TimeInterval
+            if let nextStart {
+                let preferredEnd = min(nextStart - cueGap, start + maximumDuration)
+                end = max(start + minimumDuration, preferredEnd)
+            } else {
+                end = start + 3.0
+            }
+
+            let cueText = [
+                entry.original.trimmingCharacters(in: .whitespacesAndNewlines),
+                entry.translated.trimmingCharacters(in: .whitespacesAndNewlines)
+            ]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+
+            return """
+            \(index + 1)
+            \(Self.srtTimestamp(for: start)) --> \(Self.srtTimestamp(for: end))
+            \(cueText)
+            """
+        }
+        .joined(separator: "\n\n")
     }
 
     private static func mapToSpeechLocale(from lang: String) -> String {
@@ -249,204 +427,188 @@ final class ViewModel: ObservableObject {
         default: return lang
         }
     }
+
+    private static func clamp<T: Comparable>(_ value: T, min minValue: T, max maxValue: T) -> T {
+        Swift.max(minValue, Swift.min(value, maxValue))
+    }
+
+    private var exportableCaptionEntries: [CaptionEntry] {
+        recentEntries
+            .filter { !$0.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !$0.translated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
+    private static func srtTimestamp(for interval: TimeInterval) -> String {
+        let clamped = max(0, interval)
+        let totalMilliseconds = Int((clamped * 1000).rounded())
+        let hours = totalMilliseconds / 3_600_000
+        let minutes = (totalMilliseconds % 3_600_000) / 60_000
+        let seconds = (totalMilliseconds % 60_000) / 1_000
+        let milliseconds = totalMilliseconds % 1_000
+        return String(format: "%02d:%02d:%02d,%03d", hours, minutes, seconds, milliseconds)
+    }
+
+    private static let logTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
+    private func updateTranscriberTranslationPair() {
+        if #available(macOS 26.0, *), let modern = _modernTranscriber as? ModernCaptureTranscriber {
+            modern.updateTranslationPair(sourceIdentifier: translationSource, targetIdentifier: translationTarget)
+        } else if let legacy = legacyTranscriber {
+            legacy.updateTranslationPair(sourceIdentifier: translationSource, targetIdentifier: translationTarget)
+        }
+    }
+
+    private func refreshCurrentTranslation() {
+        if #available(macOS 26.0, *), let modern = _modernTranscriber as? ModernCaptureTranscriber {
+            modern.refreshCurrentTranslation()
+        } else if let legacy = legacyTranscriber {
+            legacy.refreshCurrentTranslation()
+        }
+    }
 }
 
 struct ContentView: View {
     @EnvironmentObject private var vm: ViewModel
+    private let stageCornerRadius: CGFloat = 24
+    private let nestedCornerRadius: CGFloat = 20
 
     var body: some View {
-        GlassEffectContainer {
-            GeometryReader { proxy in
-                let isCompact = proxy.size.width < 980
-
-                VStack(spacing: 20) {
-                    headerView()
-
-                    if isCompact {
-                        VStack(spacing: 20) {
-                            settingsPanel()
-                            logPanel()
-                        }
-                    } else {
-                        HStack(alignment: .top, spacing: 20) {
-                            settingsPanel()
-                                .frame(width: min(max(340, proxy.size.width * 0.36), 480))
-                                .frame(maxHeight: .infinity)
-                            logPanel()
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .layoutPriority(1)
-                        }
-                    }
-                }
-                .padding(24)
-            }
+        NavigationSplitView {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 380)
+        } detail: {
+            detailPane
         }
-        .frame(minWidth: 860, minHeight: 560)
+        .navigationSplitViewStyle(.prominentDetail)
+        .toolbar { toolbarContent }
+        .frame(minWidth: 980, minHeight: 700)
     }
 
-    private func headerView() -> some View {
-        GlassCard {
-            HStack(alignment: .center, spacing: 16) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Subtitle")
-                        .font(.system(.title, design: .rounded).weight(.semibold))
-                    Text("系统音频字幕与本地翻译")
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                vm.toggle()
+            } label: {
+                Label(vm.isRunning ? "停止" : "开始", systemImage: vm.isRunning ? "stop.circle.fill" : "play.circle.fill")
+            }
+            .help(vm.isRunning ? "停止捕获" : "开始捕获")
+            .buttonStyle(.glassProminent)
+            .tint(vm.isRunning ? .red : .accentColor)
+            .keyboardShortcut(.space, modifiers: [])
+        }
+        .sharedBackgroundVisibility(.visible)
+    }
+
+    private var sidebar: some View {
+        SubtitleSettingsView()
+            .navigationTitle("设置")
+    }
+
+    private var detailPane: some View {
+        GeometryReader { geometry in
+            VStack(alignment: .leading, spacing: 20) {
+                previewSection(availableWidth: geometry.size.width - 48)
+                logPanel()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .navigationTitle("实时字幕")
+    }
+
+    private func previewSection(availableWidth: CGFloat) -> some View {
+        let stageHeight = previewStageHeight(for: availableWidth)
+        let previewWindowSize = fittedPreviewWindowSize(in: CGSize(width: availableWidth, height: stageHeight))
+        let bubbleWidth = max(260, previewWindowSize.width - 32)
+
+        return GroupBox {
+            ZStack {
+                PreviewBackdrop()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                OverlayPreviewBubble(
+                    lines: previewLines(),
+                    style: vm.backgroundStyle,
+                    fontSize: vm.fontSize,
+                    strength: vm.backgroundOpacity,
+                    bubbleWidth: bubbleWidth
+                )
+                .frame(width: previewWindowSize.width, height: previewWindowSize.height)
+                .shadow(color: Color.black.opacity(0.16), radius: 18, y: 10)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: stageHeight)
+            .clipShape(RoundedRectangle(cornerRadius: stageCornerRadius, style: .continuous))
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("实时预览")
+                    Text(vm.isRunning ? "字幕浮层正在跟随系统音频更新" : "开始捕获后会在这里同步显示转写与翻译")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
-                        .font(.system(.callout, design: .rounded))
                 }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 8) {
-                    Button {
-                        vm.toggle()
-                    } label: {
-                        Label(vm.isRunning ? "停止" : "开始", systemImage: vm.isRunning ? "stop.circle.fill" : "play.circle.fill")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(vm.isRunning ? .red : .accentColor)
-                    .keyboardShortcut(.space, modifiers: [])
 
-                    HStack(spacing: 6) {
-                        Image(systemName: "command")
-                        Text("Shift+Space 全局切换")
-                    }
-                    .foregroundStyle(.secondary)
-                    .font(.caption)
-                }
+                Spacer(minLength: 12)
+                statusBadge
             }
         }
-    }
-
-    private func settingsPanel() -> some View {
-        GlassCard {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    Text("设置")
-                        .font(.headline)
-
-                    settingsSection("语言") {
-                        Grid(horizontalSpacing: 12, verticalSpacing: 10) {
-                            GridRow {
-                                rowLabel("源语言")
-                                Picker("源语言", selection: $vm.translationSource) {
-                                    Text("英语 (English)").tag("en")
-                                    Text("日语 (日本語)").tag("ja")
-                                    Text("中文 (简体)").tag("zh-Hans")
-                                    Text("中文 (繁体)").tag("zh-Hant")
-                                    Text("韩语 (한국어)").tag("ko")
-                                    Text("法语 (Français)").tag("fr")
-                                    Text("德语 (Deutsch)").tag("de")
-                                    Text("西班牙语 (Español)").tag("es")
-                                    Text("俄语 (Русский)").tag("ru")
-                                    Text("意大利语 (Italiano)").tag("it")
-                                    Text("葡萄牙语 (Português)").tag("pt")
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-
-                            GridRow {
-                                rowLabel("目标语言")
-                                Picker("目标语言", selection: $vm.translationTarget) {
-                                    Text("中文 (简体)").tag("zh-Hans")
-                                    Text("中文 (繁体)").tag("zh-Hant")
-                                    Text("英语").tag("en")
-                                    Text("日语").tag("ja")
-                                    Text("韩语").tag("ko")
-                                    Text("法语").tag("fr")
-                                    Text("德语").tag("de")
-                                    Text("西班牙语").tag("es")
-                                    Text("俄语").tag("ru")
-                                    Text("意大利语").tag("it")
-                                    Text("葡萄牙语").tag("pt")
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                    }
-
-                    settingsSection("显示") {
-                        Grid(horizontalSpacing: 12, verticalSpacing: 10) {
-                            GridRow {
-                                rowLabel("条数")
-                                Stepper("\(vm.maxLines)", value: $vm.maxLines, in: 1...10)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-
-                            GridRow {
-                                rowLabel("字体")
-                                Stepper("\(Int(vm.fontSize))", value: $vm.fontSize, in: 12...48, step: 2)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                    }
-
-                    settingsSection("外观") {
-                        Grid(horizontalSpacing: 12, verticalSpacing: 10) {
-                            GridRow {
-                                rowLabel("风格")
-                                Picker("风格", selection: $vm.backgroundStyle) {
-                                    ForEach(OverlayBackgroundStyle.allCases) { style in
-                                        Text(style.rawValue).tag(style)
-                                    }
-                                }
-                                .pickerStyle(.segmented)
-                            }
-
-                            GridRow {
-                                rowLabel("透明度")
-                                HStack(spacing: 8) {
-                                    Slider(value: $vm.backgroundOpacity, in: 0.2...1.0)
-                                    Text("\(Int(vm.backgroundOpacity * 100))%")
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 40, alignment: .trailing)
-                                }
-                            }
-                        }
-                    }
-
-                    settingsSection("行为") {
-                        Toggle("自动滚动", isOn: $vm.autoScroll)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
+        .frame(maxWidth: .infinity)
     }
 
     private func logPanel() -> some View {
-        MaterialCard {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text("日志")
-                        .font(.headline)
-                    Spacer()
-                    HStack(spacing: 8) {
-                        Button("清空") {
-                            vm.clearLogs()
-                        }
-                        Button("保存…") {
-                            saveLogs()
-                        }
-                        if vm.isRunning {
-                            Label("进行中", systemImage: "dot.radiowaves.left.and.right")
-                                .foregroundStyle(.secondary)
-                                .font(.caption)
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-
+        GroupBox {
+            if hasLogOutput {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(combinedDisplayText())
-                                .font(.system(.body, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .textSelection(.enabled)
-                                .id("bottom")
+                        VStack(alignment: .leading, spacing: 14) {
+                            if !statusFeedLines.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("运行状态")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+
+                                    ForEach(Array(statusFeedLines.enumerated()), id: \.offset) { _, line in
+                                        Text(line)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                                .padding(14)
+                                .background(.background.secondary, in: RoundedRectangle(cornerRadius: nestedCornerRadius, style: .continuous))
+                            }
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("字幕记录")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+
+                                LazyVStack(alignment: .leading, spacing: 14) {
+                                    ForEach(groupedLogEntries) { group in
+                                        VStack(alignment: .leading, spacing: 10) {
+                                            Text(group.title)
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(.secondary)
+
+                                            ForEach(group.entries) { entry in
+                                                LogEntryCard(entry: entry)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        .padding(8)
+                        .padding(16)
+                        .id("bottom")
                     }
+                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: stageCornerRadius, style: .continuous))
                     .onChange(of: vm.logText) {
                         guard vm.autoScroll else { return }
                         proxy.scrollTo("bottom", anchor: .bottom)
@@ -456,115 +618,318 @@ struct ContentView: View {
                         proxy.scrollTo("bottom", anchor: .bottom)
                     }
                 }
+                .frame(minHeight: 320)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ContentUnavailableView {
+                    Label("日志将在这里显示", systemImage: "text.append")
+                } description: {
+                    Text("开始捕获后，这里会显示状态变化和最近的字幕记录。")
+                }
+                .frame(maxWidth: .infinity, minHeight: 220, maxHeight: .infinity)
+                .background(.background.secondary, in: RoundedRectangle(cornerRadius: stageCornerRadius, style: .continuous))
+            }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("活动日志")
+                    Text("查看最近的转写、翻译和运行状态变化。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 12)
+
+                HStack(spacing: 8) {
+                    Menu("导出") {
+                        Button("文本日志…") {
+                            vm.exportLogs()
+                        }
+                        .disabled(!vm.hasExportableLog)
+
+                        Button("SRT 字幕…") {
+                            vm.exportSRT()
+                        }
+                        .disabled(!vm.hasExportableCaptions)
+                    }
+                    .disabled(!vm.hasExportableLog && !vm.hasExportableCaptions)
+
+                    Button("清空") {
+                        vm.clearLogs()
+                    }
+                    .disabled(!hasLogOutput)
+                }
+                .controlSize(.small)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private func settingsSection(_ title: String, @ViewBuilder content: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.secondary)
-            content()
-        }
+    private var hasLogOutput: Bool {
+        !statusFeedLines.isEmpty || !groupedLogEntries.isEmpty
     }
 
-    private func combinedDisplayText() -> String {
-        let statusLines = vm.logText
+    private var statusFeedLines: [String] {
+        let allLines = vm.logText
             .components(separatedBy: "\n")
             .filter { $0.hasPrefix("[") && !$0.hasPrefix("[进行中]") }
-        let entries = vm.recentEntries
-
-        if statusLines.isEmpty && entries.isEmpty {
-            return "日志输出将显示在这里…\n首次使用会请求‘屏幕录制’和‘语音识别’权限。"
-        }
-
-        var result = ""
-
-        let maxStatusEntries = 8
-        if !statusLines.isEmpty {
-            let start = max(0, statusLines.count - maxStatusEntries)
-            for line in statusLines[start...] {
-                result += line + "\n"
-            }
-            result += "\n"
-        }
-
-        let maxLogEntries = 50
-        let start = max(0, entries.count - maxLogEntries)
-        for entry in entries[start...] {
-            if !entry.original.isEmpty {
-                result += entry.original + "\n"
-            }
-            if !entry.translated.isEmpty {
-                result += "译: " + entry.translated + "\n"
-            }
-            result += "\n"
-        }
-
-        return result
+        return Array(allLines.suffix(6))
     }
 
-    @MainActor
-    private func saveLogs() {
-        let content = vm.exportLogText()
-        guard !content.isEmpty else {
-            vm.logUserMessage("[提示] 当前没有可保存的日志。")
-            return
-        }
+    private var groupedLogEntries: [LogEntryGroup] {
+        let calendar = Calendar.current
+        let entries = Array(vm.recentEntries.suffix(24).reversed())
+        var buckets: [(day: Date, entries: [CaptionEntry])] = []
 
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [UTType.plainText]
-        panel.nameFieldStringValue = "subtitle-log.txt"
-        panel.canCreateDirectories = true
-        panel.isExtensionHidden = false
-
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in
-                do {
-                    try content.write(to: url, atomically: true, encoding: .utf8)
-                    vm.logUserMessage("[信息] 日志已保存: \(url.lastPathComponent)")
-                } catch {
-                    vm.logUserMessage("[错误] 保存日志失败: \(error.localizedDescription)")
-                }
+        for entry in entries {
+            let day = calendar.startOfDay(for: entry.createdAt)
+            if let index = buckets.firstIndex(where: { calendar.isDate($0.day, inSameDayAs: day) }) {
+                buckets[index].entries.append(entry)
+            } else {
+                buckets.append((day: day, entries: [entry]))
             }
         }
-    }
-}
 
-private func rowLabel(_ text: String) -> some View {
-    Text(text)
-        .foregroundStyle(.secondary)
-        .frame(width: 70, alignment: .leading)
-}
-
-private struct GlassCard<Content: View>: View {
-    @ViewBuilder var content: () -> Content
-
-    var body: some View {
-        content()
-            .padding(18)
-            .glassEffect(in: RoundedRectangle(cornerRadius: 18))
-            .tint(Color.white.opacity(0.12))
-    }
-}
-
-private struct MaterialCard<Content: View>: View {
-    @ViewBuilder var content: () -> Content
-
-    var body: some View {
-        content()
-            .padding(18)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
-            .overlay(
-                RoundedRectangle(cornerRadius: 18)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        return buckets.map { bucket in
+            LogEntryGroup(
+                title: groupTitle(for: bucket.day, calendar: calendar),
+                entries: bucket.entries
             )
+        }
+    }
+
+    private var statusBadge: some View {
+        Label(vm.isRunning ? "捕获中" : "未开始", systemImage: vm.isRunning ? "waveform.badge.mic" : "pause.circle")
+            .font(.caption.weight(.medium))
+            .foregroundStyle(vm.isRunning ? Color.accentColor : .secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.background.secondary, in: Capsule(style: .continuous))
+    }
+
+    private func previewLines() -> [PreviewCaptionLine] {
+        let currentOriginal = vm.currentOriginal.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentTranslated = vm.currentTranslated.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !currentOriginal.isEmpty || !currentTranslated.isEmpty {
+            var lines: [PreviewCaptionLine] = []
+            if !currentOriginal.isEmpty {
+                lines.append(PreviewCaptionLine(text: currentOriginal, isTranslation: false))
+            }
+            if !currentTranslated.isEmpty {
+                lines.append(PreviewCaptionLine(text: currentTranslated, isTranslation: true))
+            }
+            return lines
+        }
+
+        if let last = vm.recentEntries.last, !last.original.isEmpty || !last.translated.isEmpty {
+            var lines: [PreviewCaptionLine] = []
+            if !last.original.isEmpty {
+                lines.append(PreviewCaptionLine(text: last.original, isTranslation: false))
+            }
+            if !last.translated.isEmpty {
+                lines.append(PreviewCaptionLine(text: last.translated, isTranslation: true))
+            }
+            return lines
+        }
+
+        return [
+            PreviewCaptionLine(text: "Real-time captions follow the system audio.", isTranslation: false),
+            PreviewCaptionLine(text: "实时字幕会跟随系统音频更新。", isTranslation: true)
+        ]
+    }
+
+    private func fittedPreviewWindowSize(in availableSize: CGSize) -> CGSize {
+        let currentSize = vm.overlayPreviewSize
+        let sourceWidth = Swift.max(currentSize.width, 320)
+        let sourceHeight = Swift.max(currentSize.height, 80)
+        let aspect = Swift.min(Swift.max(sourceWidth / sourceHeight, 2.2), 5.4)
+
+        let maxWidth = Swift.max(availableSize.width - 40, 320)
+        let maxHeight = Swift.max(availableSize.height - 32, 90)
+
+        let widthFromHeight = maxHeight * aspect
+        if widthFromHeight <= maxWidth {
+            return CGSize(width: widthFromHeight, height: maxHeight)
+        }
+
+        return CGSize(width: maxWidth, height: maxWidth / aspect)
+    }
+
+    private func previewStageHeight(for availableWidth: CGFloat) -> CGFloat {
+        let currentSize = vm.overlayPreviewSize
+        let sourceWidth = Swift.max(currentSize.width, 320)
+        let sourceHeight = Swift.max(currentSize.height, 80)
+        let aspect = Swift.min(Swift.max(sourceWidth / sourceHeight, 2.2), 5.4)
+        let fittedHeight = Swift.max(availableWidth, 360) / aspect
+        return Swift.min(Swift.max(fittedHeight, 240), 360)
+    }
+
+    private func groupTitle(for day: Date, calendar: Calendar) -> String {
+        if calendar.isDateInToday(day) {
+            return "今天"
+        }
+        if calendar.isDateInYesterday(day) {
+            return "昨天"
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter.string(from: day)
     }
 }
 
-#Preview {
-    ContentView()
-        .environmentObject(ViewModel())
+private struct PreviewCaptionLine: Identifiable {
+    let id = UUID()
+    let text: String
+    let isTranslation: Bool
+}
+
+private struct LogEntryGroup: Identifiable {
+    let title: String
+    let entries: [CaptionEntry]
+
+    var id: String { title }
+}
+
+private struct PreviewBackdrop: View {
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.16, green: 0.26, blue: 0.46),
+                    Color(red: 0.12, green: 0.45, blue: 0.55),
+                    Color(red: 0.82, green: 0.48, blue: 0.26)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+
+            Circle()
+                .fill(Color.white.opacity(0.28))
+                .frame(width: 220, height: 220)
+                .blur(radius: 30)
+                .offset(x: -120, y: -40)
+
+            Circle()
+                .fill(Color.white.opacity(0.22))
+                .frame(width: 180, height: 180)
+                .blur(radius: 28)
+                .offset(x: 140, y: 56)
+        }
+    }
+}
+
+private struct OverlayPreviewBubble: View {
+    let lines: [PreviewCaptionLine]
+    let style: OverlayBackgroundStyle
+    let fontSize: CGFloat
+    let strength: Double
+    let bubbleWidth: CGFloat
+
+    var body: some View {
+        Group {
+            switch style {
+            case .glass:
+                NativeGlassContainer(
+                    cornerRadius: 20,
+                    style: .regular,
+                    tintColor: nativeGlassTintColor
+                ) {
+                    captionTextStack
+                        .padding(.horizontal, 26)
+                        .padding(.vertical, 18)
+                        .frame(width: bubbleWidth, alignment: .center)
+                }
+                .frame(width: bubbleWidth)
+
+            case .solid:
+                captionTextStack
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 14)
+                    .frame(width: bubbleWidth, alignment: .center)
+                    .background(Color.black.opacity(strength), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+            case .material:
+                captionTextStack
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 14)
+                    .frame(width: bubbleWidth, alignment: .center)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .opacity(strength)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var captionTextStack: some View {
+        VStack(spacing: 6) {
+            ForEach(lines) { line in
+                Text(line.text)
+                    .font(.system(
+                        size: line.isTranslation ? fontSize * 0.9 : fontSize,
+                        weight: line.isTranslation ? .medium : .semibold,
+                        design: .rounded
+                    ))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.88)
+                    .foregroundStyle(line.isTranslation ? Color.white.opacity(0.82) : Color.white)
+            }
+        }
+        .frame(width: max(220, bubbleWidth - 52), alignment: .center)
+    }
+
+    private var nativeGlassTintColor: NSColor {
+        let normalized = min(max((strength - 0.2) / 0.8, 0.0), 1.0)
+        let alpha = 0.01 + (normalized * 0.10)
+        return NSColor.black.withAlphaComponent(alpha)
+    }
+}
+
+private struct LogEntryCard: View {
+    let entry: CaptionEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(Self.timeFormatter.string(from: entry.createdAt))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+
+            if !entry.original.isEmpty {
+                Text(entry.original)
+                    .font(.body.weight(.medium))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if !entry.translated.isEmpty {
+                Text(entry.translated)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(14)
+        .background(.background.tertiary, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+}
+
+struct ContentView_Previews: PreviewProvider {
+    static var previews: some View {
+        ContentView()
+            .environmentObject(ViewModel())
+    }
 }

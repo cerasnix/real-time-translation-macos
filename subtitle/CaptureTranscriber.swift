@@ -20,17 +20,35 @@ final class CaptureTranscriber: NSObject, ObservableObject {
     private var recognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private let translationPairLock = NSLock()
+    private var translationSourceIdentifier: String = "en"
+    private var translationTargetIdentifier: String = "zh-Hans"
 
     private var lastTranslatedSource: String = ""
     private var lastDisplayedSentence: String = ""
     private var lastLoggedSentence: String = ""
     private var hasLoggedPartialResult: Bool = false
     private var partialUpdateTimer: Timer?
-    private var translationTask: Task<Void, Never>?
+    private var previewTranslationTask: Task<Void, Never>?
+    private var finalTranslationTasks: [UUID: Task<Void, Never>] = [:]
     private var lastDisplayUpdate: CFTimeInterval = 0
     private let maxLogLines: Int = 200
     private let maxRecentEntries: Int = 50
     private let minDisplayInterval: CFTimeInterval = 0.15
+
+    func updateTranslationPair(sourceIdentifier: String, targetIdentifier: String) {
+        translationPairLock.lock()
+        translationSourceIdentifier = sourceIdentifier
+        translationTargetIdentifier = targetIdentifier
+        translationPairLock.unlock()
+    }
+
+    func refreshCurrentTranslation() {
+        let currentText = currentOriginal.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !currentText.isEmpty else { return }
+        lastTranslatedSource = ""
+        scheduleTranslation(for: currentText)
+    }
 
     func start(locale: Locale = Locale.current, contentFilter: SCContentFilter? = nil) {
         guard !isRunning else { return }
@@ -55,7 +73,7 @@ final class CaptureTranscriber: NSObject, ObservableObject {
 
             do {
                 try await self.startCaptureAndTranscribe(filter: contentFilter)
-                DispatchQueue.main.async { 
+                await MainActor.run {
                     self.isRunning = true 
                     self.startPartialUpdateTimer()
                 }
@@ -75,8 +93,12 @@ final class CaptureTranscriber: NSObject, ObservableObject {
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
-        translationTask?.cancel()
-        translationTask = nil
+        previewTranslationTask?.cancel()
+        previewTranslationTask = nil
+        for task in finalTranslationTasks.values {
+            task.cancel()
+        }
+        finalTranslationTasks.removeAll()
         let currentStream = stream
         stream = nil
         DispatchQueue.main.async { self.isRunning = false }
@@ -429,13 +451,18 @@ final class CaptureTranscriber: NSObject, ObservableObject {
     }
 
     private func scheduleTranslation(for text: String) {
-        translationTask?.cancel()
-        translationTask = Task { [weak self] in
+        let (sourceIdentifier, targetIdentifier) = currentTranslationPair()
+        previewTranslationTask?.cancel()
+        previewTranslationTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 350_000_000)
             guard let self, !Task.isCancelled else { return }
-            let cn = await TranslationService.shared.translate(text)
+            let cn = await TranslationService.shared.translate(
+                text,
+                sourceIdentifier: sourceIdentifier,
+                targetIdentifier: targetIdentifier
+            )
             guard !Task.isCancelled else { return }
-            DispatchQueue.main.async {
+            await MainActor.run {
                 self.currentTranslated = cn
                 let original = self.currentOriginal
                 if !original.isEmpty || !cn.isEmpty {
@@ -448,12 +475,17 @@ final class CaptureTranscriber: NSObject, ObservableObject {
     }
 
     private func translateFinal(_ text: String, entryID: UUID, wasPartialLogged: Bool) {
-        translationTask?.cancel()
-        translationTask = Task { [weak self] in
+        let (sourceIdentifier, targetIdentifier) = currentTranslationPair()
+        finalTranslationTasks[entryID]?.cancel()
+        let task = Task { [weak self] in
             guard let self, !Task.isCancelled else { return }
-            let cn = await TranslationService.shared.translate(text)
+            let cn = await TranslationService.shared.translate(
+                text,
+                sourceIdentifier: sourceIdentifier,
+                targetIdentifier: targetIdentifier
+            )
             guard !Task.isCancelled else { return }
-            DispatchQueue.main.async {
+            await MainActor.run {
                 if !cn.isEmpty {
                     self.updateRecentEntry(id: entryID, translated: cn)
                     if wasPartialLogged {
@@ -462,15 +494,20 @@ final class CaptureTranscriber: NSObject, ObservableObject {
                         self.appendTranslation(cn)
                     }
                 }
-                self.currentTranslated = cn
-                let original = self.currentOriginal
-                if !original.isEmpty || !cn.isEmpty {
-                    self.currentCombined = original.isEmpty ? "译: \(cn)" : (cn.isEmpty ? original : "\(original)\n译: \(cn)")
-                } else {
-                    self.currentCombined = ""
+                let currentOriginal = self.currentOriginal.trimmingCharacters(in: .whitespacesAndNewlines)
+                let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if currentOriginal == normalizedText {
+                    self.currentTranslated = cn
+                    if !currentOriginal.isEmpty || !cn.isEmpty {
+                        self.currentCombined = currentOriginal.isEmpty ? "译: \(cn)" : (cn.isEmpty ? currentOriginal : "\(currentOriginal)\n译: \(cn)")
+                    } else {
+                        self.currentCombined = ""
+                    }
                 }
+                self.finalTranslationTasks[entryID] = nil
             }
         }
+        finalTranslationTasks[entryID] = task
     }
 
     private func appendLine(_ line: String, to text: String) -> String {
@@ -504,6 +541,12 @@ final class CaptureTranscriber: NSObject, ObservableObject {
         #if DEBUG
         print(message)
         #endif
+    }
+
+    private func currentTranslationPair() -> (sourceIdentifier: String, targetIdentifier: String) {
+        translationPairLock.lock()
+        defer { translationPairLock.unlock() }
+        return (translationSourceIdentifier, translationTargetIdentifier)
     }
 
     private static func requestSpeechAuthorization() async -> Bool {

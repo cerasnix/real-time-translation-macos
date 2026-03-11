@@ -19,6 +19,7 @@ struct subtitleApp: App {
                 .environmentObject(vm)
         }
         .commands {
+            SidebarCommands()
             AppCommands(vm: vm)
         }
     }

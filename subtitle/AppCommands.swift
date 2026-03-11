@@ -17,5 +17,24 @@ struct AppCommands: Commands {
                     .keyboardShortcut(.space, modifiers: [.command, .shift])
             }
         }
+
+        CommandMenu("日志") {
+            Button("导出文本日志…") {
+                vm.exportLogs()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .option])
+            .disabled(!vm.hasExportableLog)
+
+            Button("导出 SRT 字幕…") {
+                vm.exportSRT()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .option, .control])
+            .disabled(!vm.hasExportableCaptions)
+
+            Button("清空日志") {
+                vm.clearLogs()
+            }
+            .disabled(!vm.hasExportableLog)
+        }
     }
 }

@@ -39,6 +39,7 @@ subtitle.xcodeproj/xcuserdata/
 
 # Compiler intermediate
 *.hmap
+ModuleCache/
 
 # Crashlytics / Symbolication
 *.dSYM
@@ -47,4 +48,3 @@ subtitle.xcodeproj/xcuserdata/
 # Editors
 .idea/
 .vscode/
-

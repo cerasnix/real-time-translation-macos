@@ -9,7 +9,7 @@ enum ContentSharingPickerError: Error {
 }
 
 @MainActor
-final class ContentSharingPickerManager: NSObject, SCContentSharingPickerObserver {
+final class ContentSharingPickerManager: NSObject, @preconcurrency SCContentSharingPickerObserver {
     static let shared = ContentSharingPickerManager()
 
     private var continuation: CheckedContinuation<SCContentFilter, Error>?

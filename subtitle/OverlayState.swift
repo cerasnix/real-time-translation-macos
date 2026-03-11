@@ -8,3 +8,25 @@ final class OverlayState: ObservableObject {
     @Published var yRatio: CGFloat = 0.12
 }
 
+struct OverlayContentSnapshot {
+    var currentOriginal: String = ""
+    var currentTranslated: String = ""
+    var recentEntries: [CaptionEntry] = []
+}
+
+@MainActor
+final class OverlayContentState: ObservableObject {
+    @Published var currentOriginal: String = ""
+    @Published var currentTranslated: String = ""
+    @Published var recentEntries: [CaptionEntry] = []
+
+    func apply(snapshot: OverlayContentSnapshot) {
+        currentOriginal = snapshot.currentOriginal
+        currentTranslated = snapshot.currentTranslated
+        recentEntries = snapshot.recentEntries
+    }
+
+    func reset() {
+        apply(snapshot: OverlayContentSnapshot())
+    }
+}
